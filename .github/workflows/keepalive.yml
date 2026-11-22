@@ -1,13 +1,18 @@
 name: instabox-keepalive
 
-# 每 10 分钟访问一次机器的公开探针 URL。
+# 每 8 分钟跑一次「探活 + 主动唤醒」。
 #
-# cron 刻意不用 */10：GitHub 的调度器在整点和半点最拥堵，延迟可达 15~45 分钟，
-# 而 InstaBox 的空闲上限只有 30 分钟。所以用错峰的 3/13/23/33/43/53 分，
-# 避开 0 分和 30 分的调度高峰。
+# 为什么不能只探活（2026-11-23 实测踩坑）：
+#   机器撞上免费档 480 分钟运行上限后进入冷却，探针只会返回 409，
+#   而**探针唤不醒处于冷却中的机器**。必须等到 cooldownUntil 之后，
+#   再用 exec / wake 端点主动唤醒。只探活的方案会让代理彻底失联。
+#
+# 为什么用 3,11,19,27,35,43,51,59 分：
+#   GitHub 调度器在整点和半点最拥堵，延迟可达 15~45 分钟，
+#   而 InstaBox 空闲上限只有 30 分钟。错峰跑，别撞 0 分和 30 分。
 on:
   schedule:
-    - cron: '3,13,23,33,43,53 * * * *'
+    - cron: '3,11,19,27,35,43,51,59 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -15,12 +20,45 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  ping:
+  keepalive:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ping probe
-        run: bash keepalive.sh
+      # 探活不需要密钥
+      - name: Probe public port
+        id: probe
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 \
+            "$PROBE_URL" || echo 000)
+          echo "http=$code" >> "$GITHUB_OUTPUT"
+          echo "probe http=$code"
+
+      # 只有探活失败才需要唤醒，而唤醒需要 API Key
+      - name: Wake machine (needs API key)
+        if: steps.probe.outputs.http != '200'
+        env:
+          INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+        run: |
+          if [ -z "$INSTABOX_API_KEY" ]; then
+            echo "::warning::未配置 secrets.INSTABOX_API_KEY，无法唤醒（仅探活）"
+            exit 0
+          fi
+          printf '%s' "$INSTABOX_API_KEY" > "$INSTABOX_API_KEY_FILE"
+          chmod 600 "$INSTABOX_API_KEY_FILE"
+          bash keepalive-v3.sh
+
+      - name: Probe again
+        if: steps.probe.outputs.http != '200'
+        run: |
+          sleep 20
+          curl -s -o /dev/null -w 'final http=%{http_code}\n' --max-time 25 "$PROBE_URL" || true
+
+    env:
+      PROBE_URL: https://8899-agq72vcykb5a6rh5unklogksla.instabox.tech
+      INSTABOX_MACHINE_ID: m_agq72vcykb5a6rh5unklogksla
+      INSTABOX_KEEPALIVE_LOG: ${{ runner.temp }}/keepalive.log
+      INSTABOX_KEEPALIVE_STATE: ${{ runner.temp }}/keepalive.state
+      INSTABOX_API_KEY_FILE: ${{ runner.temp }}/api_key

@@ -1,57 +1,96 @@
 # instabox-keepalive
 
-定时访问 InstaBox 机器 `jgp` 的公开探针端口，阻止 30 分钟空闲自动暂停，并延长单轮运行时限。
+定时探活并**主动唤醒** InstaBox 机器 `jgp`，保证 VLESS+WS 代理长期在线。
 
 ## 为什么要保活
 
-InstaBox 免费档的两条硬规则：
+InstaBox 免费档的两条硬规则（来源：官方文档 `instabox.sh/docs/machines/auto-pause`）：
 
 | 规则 | 数值 | 影响 |
 |---|---|---|
-| 空闲自动暂停 | 30 分钟（免费档写死，不可改） | 机器被冻结后**自己唤不醒自己** |
-| 单轮运行时限 | 120 分钟起，用得多最长 480 分钟 | 8 小时后强制冷却 5~20 分钟 |
+| 空闲自动暂停 | 30 分钟（免费档写死，不可改） | 机器被冻结后要靠外部请求唤醒 |
+| 单轮运行时限 | 每次唤醒从 120 分钟起，用得多最长 480 分钟 | 用满后强制冷却 |
 
-官方规则里，**命令、文件访问、端口访问、SSH、CPU≥0.25 核**算「使用中」，能同时防空闲暂停并延长时限；
-而 Activity lease 和 wake 调用**不算**使用中，只能防暂停。
+**算「使用中」**（能防空闲暂停 **且** 延长时限）：命令执行、文件读写、端口请求、桌面操作、终端/SSH 流量、CPU ≥ 0.25 vCPU。
 
-所以保活的关键是：**从外部定期访问机器的公开端口 URL**。
+**不算「使用中」**（只能防空闲暂停，救不回运行时限）：Activity lease、`wake` 调用。
 
-## 三层保活
+限时的涨法：过去 30 分钟里，≥5 分钟算使用 → +120 分钟；1~4 分钟 → +30 分钟；完全没有 → 到点即暂停。
 
-| 层 | 位置 | 频率 | 说明 |
+## ⚠️ 关键教训：只探活是不够的（2026-11-23 实战）
+
+机器撞上 480 分钟上限后进入**冷却期**，此时：
+
+- 探针 URL 一律返回 **409**（不是 200，也不是 503）
+- **`wake` 和 `exec` 也一样返回 409 `machine_cooldown`**，带 `retryAfterSeconds`
+- 冷却期内**没有任何办法唤醒**，必须等 `cooldownUntil` 到点后再发一次请求
+- 冷却长度在开始时固定，重复调用不会延长也不会缩短
+
+实测后果：v1 方案（只探活）在冷却后连续 7 次 409，**从来没把机器叫醒**，
+代理就此彻底失联 —— 用户手机上连不上谷歌。
+
+**冷却阶梯**（免费档，连续撞上限会越来越久）：
+
+| 次数 | 冷却时长 |
+|---|---|
+| 第 1 次 | 5~20 分钟 |
+| 第 2 次 | 60~75 分钟 |
+| 第 3 次起 | 120~135 分钟 |
+
+> 冷却计数在「空闲暂停」或「手动暂停」后重置；距上次冷却结束 2 小时以上再启动也会重置。
+
+## v3 方案：探针 + exec + wake 三级
+
+`keepalive-v3.sh` 的逻辑：
+
+1. **探活**公开端口（算使用中，把运行上限养回 480）—— 成功即结束
+2. 探活失败 → **`exec` 主动唤醒**（会等 resume 完成，最多 45 秒；最强手段，且算使用中）
+3. `exec` 也失败 → 退化为 **`wake`**（最弱，仅防空闲暂停）
+4. 冷却期内记下 `cooldownUntil`，**不空转**，到点后自动重试唤醒
+
+频率 **8 分钟**：30 分钟空闲上限留近 4 倍余量；过去 30 分钟内有 3~4 次探针，
+足以满足「至少 5 分钟使用中」的涨限条件。
+
+## 三层部署
+
+| 层 | 位置 | 频率 | 状态 |
 |---|---|---|---|
-| 主力 | 阿里云 `wb2a` 的 crontab | 10 分钟 | 24/7 常开，不依赖本机 |
-| 内部续命 | 机器内 `ib-selfkeep.service` | 10 分钟 | 机器自己调 API exec，叠加使用时长 |
-| 辅助 | 本仓库 GitHub Actions | 10 分钟 | 错峰 cron；实测该账号 schedule 未触发，作备份 |
+| **主力** | 阿里云 `wb2a` crontab | 8 分钟 | ✅ 24/7 常开，不依赖本机 |
+| 内部续命 | 机器内 `ib-selfkeep.service` | 10 分钟 | ✅ 机器自己调 API exec |
+| 辅助 | 本仓库 GitHub Actions | 8 分钟 | ⚠️ 该账号 schedule 实测未触发，作冗余 |
 
 > 本仓库的 GitHub schedule 在本账号下实测 30 分钟内 0 次自动运行
 > （账号内所有仓库的 schedule 运行数均为 0），故**不作为依赖项**。
-> 公开仓库可无限使用 Actions 额度，保留作冗余。
+
+## 密钥
+
+唤醒需要 API Key。本仓库**不含**密钥。
+
+- 主力层：`wb2a` 上 `~/.config/instabox/api_key`（600 权限）
+- GitHub 层：仓库 Secret `INSTABOX_API_KEY`（需手动配置，未配置则只探活不唤醒）
 
 ## 探针
 
 远端 `ib-keepalive.service`（systemd 常驻，监听 8899），任何 GET 返回 200 + 时间戳。
 
 - 公开 URL：`https://8899-agq72vcykb5a6rh5unklogksla.instabox.tech`
-- 只回 200，不泄露任何信息；探针 URL 本身即公开入口
+- 只回 200，不泄露任何信息
 
 ## 手动触发
 
 GitHub Actions → `instabox-keepalive` → Run workflow
 
-## 远端探针状态
+## 状态检查
 
 ```bash
-ssh -p 2222 ibssh_el3nfkt5jxi73wjhapkwut7bda@ssh.instabox.sh
-systemctl status ib-keepalive.service ib-selfkeep.service
-journalctl -u ib-selfkeep.service -n 20
-journalctl -u ib-keepalive.service -n 20
-```
+# 机器状态（state / cooldownUntil / runStartedAt）
+curl -s -H "X-API-Key: $(cat ~/.config/instabox/api_key)" \
+  https://api.instabox.sh/v1/machines/m_agq72vcykb5a6rh5unklogksla
 
-## wb2a 侧状态
+# 保活日志
+ssh wb2a 'tail -20 ~/.config/instabox-keepalive.log'
 
-```bash
-ssh wb2a
-crontab -l | grep instabox
-tail -20 ~/.config/instabox-keepalive.log
+# 远端服务
+ssh -p 2222 ibssh_el3nfkt5jxi73wjhapkwut7bda@ssh.instabox.sh \
+  'systemctl is-active ib-xray ib-keepalive ib-selfkeep'
 ```
