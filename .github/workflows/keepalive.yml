@@ -48,7 +48,7 @@ jobs:
           fi
           printf '%s' "$INSTABOX_API_KEY" > "$INSTABOX_API_KEY_FILE"
           chmod 600 "$INSTABOX_API_KEY_FILE"
-          bash keepalive-v3.sh
+          bash keepalive-v4.sh
 
       - name: Probe again
         if: steps.probe.outputs.http != '200'
