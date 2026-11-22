@@ -53,6 +53,58 @@ print("%s|%s" % (e.get("code") or "unknown", e.get("retryAfterSeconds") or 0))
 ' 2>/dev/null
 }
 
+# 判定 exec 结果：
+#   ok              → 有 exitCode（ExecResult），命令确实执行了
+#   machine_cooldown→ 带 retryAfterSeconds 的冷却错误
+#   other:<code>    → 其它错误
+#   network         → 空响应/非 JSON（网络失败或超时），**不能当成功**
+parse_exec() {
+  python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+if not raw:
+    print("network|0"); sys.exit(0)
+try:
+    d = json.loads(raw)
+except Exception:
+    print("network|0"); sys.exit(0)
+if not isinstance(d, dict):
+    print("network|0"); sys.exit(0)
+e = d.get("error") or {}
+if e:
+    print("%s|%s" % (e.get("code") or "unknown", e.get("retryAfterSeconds") or 0))
+    sys.exit(0)
+if "exitCode" in d:
+    print("ok|0")
+else:
+    print("other:no_exit_code|0")
+' 2>/dev/null
+}
+
+# 判定 wake 结果：成功返回 Machine 对象（含 id 与 state）。
+parse_wake() {
+  python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+if not raw:
+    print("network|0"); sys.exit(0)
+try:
+    d = json.loads(raw)
+except Exception:
+    print("network|0"); sys.exit(0)
+if not isinstance(d, dict):
+    print("network|0"); sys.exit(0)
+e = d.get("error") or {}
+if e:
+    print("%s|%s" % (e.get("code") or "unknown", e.get("retryAfterSeconds") or 0))
+    sys.exit(0)
+if "id" in d and "state" in d:
+    print("ok|0")
+else:
+    print("other:no_machine|0")
+' 2>/dev/null
+}
+
 api_post() {
   local key; key=$(read_key)
   [ -n "$key" ] || { echo '{"error":{"code":"no_key"}}'; return; }
@@ -65,7 +117,14 @@ api_post() {
 }
 
 probe() {
-  curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$PROBE_URL" 2>/dev/null || echo "000"
+  # 注意：curl 即使失败也会输出 http_code(000)，所以不能再 `|| echo 000`，
+  # 否则会拼成 "000000"。这里只取 curl 的退出码决定是否补 000。
+  local out
+  out=$(curl -s -o /dev/null -w '%{http_code}' --max-time 25 "$PROBE_URL" 2>/dev/null)
+  case "$out" in
+    (''|*[!0-9]*) echo "000" ;;
+    (*) echo "$out" ;;
+  esac
 }
 
 cooldown_until() {
@@ -81,20 +140,26 @@ clear_cooldown() { rm -f "$STATEFILE"; }
 # ---------------------------------------------------------------- exec
 # exec 会等 resume 完成（最多 45s），是最强唤醒手段，且稳定计入「使用中」。
 # 机器在跑时立即返回；机器睡了则唤醒它。
+#
+# 成功判定必须严格：ExecResult 必含 exitCode 字段。
+# 网络失败/空响应会解析出 "unknown"，不能当成成功 —— 否则会误进 150 秒 verify 循环。
+#
+# 命令用一点 CPU（算「使用中」需要 CPU ≥ 0.25 vCPU 量级的真实负载），
+# 但不能太久，否则 exec 自身会拖满 90 秒超时。
 do_exec() {
   local body out code retry
-  body=$(api_post "/exec" '{"cmd":"true"}')
-  out=$(printf '%s' "$body" | parse_err)
+  body=$(api_post "/exec" '{"cmd":"for i in 1 2 3 4 5 6 7 8 9 10; do :; done; echo alive"}')
+  out=$(printf '%s' "$body" | parse_exec)
   code=${out%%|*}; retry=${out##*|}
 
-  if [ "$code" = "unknown" ] || [ "$code" = "unparsable" ]; then
+  if [ "$code" = "ok" ]; then
     clear_cooldown
     logline "exec OK (machine awake, usage counted)"
     echo "ok"; return
   fi
 
   if [ "$code" = "machine_cooldown" ]; then
-    local until; until=$(( $(date +%s) + ${retry:-600} + 45 ))
+    local until; until=$(( $(date +%s) + ${retry:-600} + 20 ))
     set_cooldown "$until"
     logline "exec COOLDOWN retryAfter=${retry:-?}s until=$(date -d @$until '+%F %T' 2>/dev/null || echo $until)"
     echo "cooldown"; return
@@ -105,19 +170,20 @@ do_exec() {
 }
 
 # ---------------------------------------------------------------- wake（弱兜底）
+# wake 成功时返回 Machine 对象（含 id / state 字段），不是 ExecResult。
 do_wake() {
   local body out code retry
   body=$(api_post "/wake" '{}')
-  out=$(printf '%s' "$body" | parse_err)
+  out=$(printf '%s' "$body" | parse_wake)
   code=${out%%|*}; retry=${out##*|}
 
-  if [ "$code" = "unknown" ] || [ "$code" = "unparsable" ]; then
+  if [ "$code" = "ok" ]; then
     clear_cooldown
     logline "wake OK (weak, usage NOT counted)"
     echo "ok"; return
   fi
   if [ "$code" = "machine_cooldown" ]; then
-    local until; until=$(( $(date +%s) + ${retry:-600} + 45 ))
+    local until; until=$(( $(date +%s) + ${retry:-600} + 20 ))
     set_cooldown "$until"
     logline "wake COOLDOWN retryAfter=${retry:-?}s"
     echo "cooldown"; return
@@ -127,12 +193,22 @@ do_wake() {
 }
 
 # ---------------------------------------------------------------- 唤醒后确认
+# 最多 5 次 × 15 秒 = 75 秒。保活脚本不能占太久，会和 cron 下一轮撞车。
 verify() {
-  for i in 1 2 3 4 5 6 7 8 9 10; do
+  local i c
+  for i in 1 2 3 4 5; do
     sleep 15
-    local c; c=$(probe)
+    c=$(probe)
     logline "verify attempt=$i http=$c"
-    [ "$c" = "200" ] && { logline "RECOVERED probe=http=200"; return 0; }
+    if [ "$c" = "200" ]; then
+      logline "RECOVERED probe=http=200"
+      return 0
+    fi
+    # 网络层彻底不通（000），再等也没意义
+    if [ "$c" = "000" ]; then
+      logline "verify aborted (network unreachable)"
+      return 1
+    fi
   done
   logline "woke but probe still bad"
   return 1
